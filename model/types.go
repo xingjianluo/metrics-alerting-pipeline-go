@@ -159,6 +159,13 @@ const (
 	EventPending  EventType = "pending"  // resolved -> pending
 	EventFiring   EventType = "firing"   // pending -> firing
 	EventResolved EventType = "resolved" // firing/pending -> resolved
+	// EventClosed is not a data-driven state-machine transition: it is the
+	// explicit administrative conclusion emitted when a rule change removes a
+	// still-active (pending/firing) alert, either because the rule was deleted
+	// or because its new selector no longer matches the series. Closed alerts
+	// are removed from active tracking, so a later re-add starts from a clean
+	// resolved state instead of inheriting finished progress.
+	EventClosed EventType = "closed"
 )
 
 // Event is an immutable transition record with the reason behind it.

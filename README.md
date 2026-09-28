@@ -9,7 +9,9 @@
 - 查询跨越已淘汰窗口时**显式报错并返回缺口列表**，不静默返回残缺结果；
 - 告警在 `resolved → pending → firing → resolved` 间的每次转换都附带判定依据；
 - 规则热更新保留存活规则的状态，不丢告警、不重复触发；
-- 求值在互斥锁内串行完成，并发调用结论不串扰。
+- 求值在互斥锁内串行完成，并发调用结论不串扰；
+- **规则批量变更管理**：整批先校验（一条不合格整批不生效）、原子前后切换、
+  被移除告警显式收尾、每批改动可查询可追溯。
 
 ## 1. 快速开始
 
@@ -25,7 +27,8 @@ go test -race -count=1 ./... # 竞态检测（已通过）
 |---|---|
 | `model` | 数据模型：`Labels/Sample/Aggregate/Rule/AlertState/AlertEvent`、标签指纹 |
 | `storage` | 内存窗口存储：对齐聚合、幂等去重、保留期淘汰、缺口感知查询 |
-| `alert` | 规则求值与告警状态机、规则热更新 |
+| `alert` | 规则求值与告警状态机、规则热更新、**整批校验与原子切换 / 告警收尾** |
+| `change` | **规则变更管理层：批量提交（校验→应用）、审计历史、幂等重试** |
 | `pipeline` | 门面接线 + 确定性内存数据源脚本（乱序/重复/延迟） |
 | `cmd/demo` | 端到端可运行演示 |
 
@@ -133,13 +136,113 @@ Query(start, end, granularitySeconds, selector) (*QueryResult, error)
   从 `resolved` 冷启动。因此热更新**不会重放 firing 事件，也不会丢掉 pending 进度**。
 - 规则按 ID 排序、序列按指纹排序后求值，`Report.States` 快照顺序确定，可复现。
 
-## 8. 验证方法与测试覆盖
+## 8. 规则批量变更管理（新增）
+
+运维通常一次攒一批规则改动再推。`change.Manager`（门面暴露为
+`pipeline.SubmitRules / CheckRules / RuleChangeHistory`）在原有求值器之上加了
+一层「变更管理」，把推规则变成**可控、可追溯**的操作。
+
+### 8.1 整批先校验，一条不合格整批不生效
+
+- `CheckRules(rules)`：**只检查不改动**，一次性列出整批的全部问题，不写历史、
+  不动规则和状态。
+- `SubmitRules(rules, key)`：先对整批做校验，**任一规则不合格则整批拒绝**，
+  现有规则和正在跟踪的告警状态与提交前**完全一致**。
+- 校验项（关键配置）：
+  - 规则名非空，且**同一批内不允许重名**；
+  - `WindowSeconds > 0`；
+  - `AggField ∈ {count,sum,avg,min,max,latest}`；
+  - `Op ∈ {>,>=,<,<=,==,!=}`；
+  - `Threshold` 不为 `NaN/Inf`；`PendingWindows/KeepFiringWindows >= 0`。
+- 校验结果聚合成 `*alert.ValidationErrors`（多条问题全部返回），错误定位到
+  `规则 + 字段 + 原因`。
+
+### 8.2 合法批次原子前后切换，并发求值看不到半成品
+
+- 校验通过后，在求值器的**同一把互斥锁**内一次性整体替换规则切片；求值 pass
+  也持同一把锁，因此并发 `Eval` 只能看到「整批旧」或「整批新」，
+  **绝不会看到一部分新、一部分旧的撕裂规则集**（`change.TestConcurrentEvalSeesWholeRuleSet`
+  在 `-race` 下钉住该性质）。
+- 单个规则的问题在提交前就被整批拦下，不会出现「某条规则失败把整批规则与
+  存活状态一起带走」的中间态。
+- 切换与状态对齐仍按**规则 ID + 选择器**进行（见 8.3）。
+
+### 8.3 被移除/不再匹配的告警显式收尾，不重复触发、不漏跟踪
+
+切换时对每条仍在跟踪的告警分类处理：
+
+| 情况 | 处理 |
+|---|---|
+| 规则 ID 保留、新选择器仍匹配该序列 | 状态原样保留（pending 进度、firing 不丢），**不会重复触发** |
+| 规则 ID 保留、但新选择器不再匹配该序列 | 活跃告警发出 `closed` 事件（原因 `rule updated and no longer matches this series`），状态移除 |
+| 规则 ID 被删除 | 其 pending/firing 告警发出 `closed` 事件（原因 `rule deleted by batch change`），状态移除；已 resolved 的惰性状态静默清理 |
+| 规则 ID 为新增 | 不建状态，下次求值从 `resolved` 冷启动 |
+
+- `closed` 是一种**管理性收尾结论**（非数据驱动状态机迁移），事件里带
+  `之前状态 / streak / 最后观测值 / 原因`，告警不会无声无息消失。
+- 规则之后被加回来或改回来时，由于旧状态已移除，**从干净状态重新开始**，
+  不会继承已收尾的旧进度（`alert.TestBatchReaddStartsClean`）。
+- 仍然有效的告警在切换后对同一窗口重复求值**不会再触发一遍**，本该继续跟踪的
+  序列也不漏（`alert.TestBatchSelectorNarrow`）。
+
+### 8.4 每批改动留下可查询记录
+
+`SubmitRules` 返回并保存一条 `alert.BatchReport`：
+
+```
+BatchID, Ts
+Changes[]      // 每条规则：kind=added|modified|deleted|unchanged
+               // modified 含改动前/后关键配置与 ChangedFields
+ClosedEvents[] // 本批收尾掉的活跃告警（显式结论与原因）
+Affected[]     // 与 ClosedEvents 对应的结构化视图（规则/序列/前状态/原因）
+ValidationErrors // 被拒批次的全部问题（被拒同样留痕，Applied()==false）
+```
+
+- `RuleChangeHistory()` 按**最新在前**返回所有记录（含被拒批次）；
+  `RuleChangeBatch(id)` 按批次 ID 精确查询。
+- `SubmitRules` 的第二个参数是**幂等键**：相同 key 的重试返回首次的批次记录，
+  不会把规则集切换两次（适合运维重试推送）。不需要可传空串。
+
+### 8.5 与原单条热更新方式的兼容范围
+
+- 原有 `Evaluator.ReplaceRules` / `pipeline.ReplaceRules` **保留**：仍是一次性
+  原子换规则、存活 ID 保状态；但它是**未校验、不产生收尾事件、不写审计**的
+  旧路径（删除/选择器收窄时静默丢状态）。新代码建议使用
+  `CheckRules + SubmitRules`。
+- 两条路径操作同一套求值器与状态，可并存；`New(...)` 现在自带一个
+  `*change.Manager`（`pipeline.Changes`）。
+
+## 9. 验证方法与测试覆盖
 
 ```bash
 go vet ./...
 go test -race -count=1 ./...          # 竞态检测一遍（要求项）
 go test ./... -v                      # 查看带输入样本与判定依据的日志
-go run ./cmd/demo                     # 端到端演示
+go run ./cmd/demo                     # 端到端演示（第 6 节即批量变更管理）
+```
+
+本地最小验证批量变更管理的调用方式：
+
+```go
+p := pipeline.New(store, rules, now)
+
+// 1) 只检查、不改动：一次性拿到整批问题
+if verrs := p.CheckRules(candidate); verrs != nil {
+    log.Print(verrs.Error())
+    return
+}
+
+// 2) 校验通过才原子切换；幂等键避免重试重复应用
+rec, verrs := p.SubmitRules(candidate, "change-ticket-123")
+if verrs != nil { /* 整批未生效，规则/状态原样 */ }
+
+// 3) 回看这批动了什么、收尾了哪些告警
+for _, ch := range rec.Changes { /* added/modified/deleted + 前后配置 */ }
+for _, a := range rec.Affected { /* rule/labels/previous/reason */ }
+
+// 4) 事后查询任意批次
+history := p.RuleChangeHistory()   // 最新在前，含被拒批次
+one, ok := p.RuleChangeBatch(rec.BatchID)
 ```
 
 | 测试 | 覆盖点 |
@@ -154,13 +257,24 @@ go run ./cmd/demo                     # 端到端演示
 | `alert.TestHotReloadPreservesState` | 热更新保状态、删规则清状态、回退后只触发一次 |
 | `alert.TestMissingDataDoesNotResolve` | 空窗口与淘汰缺口都不改变状态 |
 | `alert.TestConcurrentEvalRace` | 并发求值 + 并发热更新结论稳定（配合 `-race`） |
+| `alert.TestValidateBatchListsAllProblems` | 只检查入口一次列清整批问题（重名/窗口/口径/运算符/阈值） |
+| `alert.TestInvalidBatchChangesNothing` | **整批非法时不生效**：规则与 firing 状态提交前后一致 |
+| `alert.TestBatchDiffRecordsAddModifyDelete` | 批次记录：新增/修改/删除/未变 + 改动前后关键配置 |
+| `alert.TestBatchDeleteClosesActiveAlerts` | **删规则时 pending/firing 显式收尾**，resolved 静默清理 |
+| `alert.TestBatchSelectorNarrow` | 选择器收窄：失配序列收尾、仍匹配序列不重复触发 |
+| `alert.TestBatchReaddStartsClean` | 规则加回来从干净状态重启，不继承已收尾进度 |
+| `change.TestCheckDoesNotMutate` | 只检查不改规则、不写历史 |
+| `change.TestSubmitAuditRecordAndIdempotency` | 被拒/成功留痕、按 ID 查询、幂等重试不重复应用 |
+| `change.TestDeleteBatchRecordsAffectedAlerts` | 批次记录列出受影响的在跟踪告警 |
+| `change.TestConcurrentEvalSeesWholeRuleSet` | **并发求值中整批切换**：无撕裂规则集、firing 仅一次（`-race`） |
+| `pipeline.TestBatchRuleChangeEndToEnd` | 门面端到端：dry-run→拒绝→原子应用→删除收尾→历史→旧接口兼容 |
 | `pipeline.TestEndToEnd` | 确定性脚本端到端：11 接受 / 2 去重、聚合值、告警生命周期、淘汰查询报错 |
 
 所有测试日志均通过 `t.Logf` 打印**输入样本**（labels/ts/value/dedup key）与
 **判定依据**（窗口、计数、比较式、streak、缺口原因），时钟全部手工注入，
 结论与运行次数、机器时间无关，稳定可复现。
 
-## 9. 设计取舍说明
+## 10. 设计取舍说明
 
 - 时间用整型 unix 秒而非 `time.Time`：为了让日志、断言与指纹在任何机器上字节级可复现。
 - 去重要求显式 `SourceID + DedupKey`：没有幂等键的写入直接 `validation_error`，

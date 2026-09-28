@@ -52,7 +52,10 @@ func NewEvaluator(reader AggReader, rules []model.Rule, now func() int64) *Evalu
 		reader: reader,
 		now:    now,
 	}
-	e.replaceRulesLocked(rules)
+	cp := make([]model.Rule, len(rules))
+	copy(cp, rules)
+	sort.SliceStable(cp, func(i, j int) bool { return cp[i].ID < cp[j].ID })
+	e.rules = cp
 	return e
 }
 
@@ -287,33 +290,22 @@ func (e *Evaluator) snapshotLocked() []model.AlertState {
 	return out
 }
 
-// ReplaceRules atomically hot-updates the rule set. States belonging to
-// surviving rule IDs are preserved so updates never lose pending progress or
-// re-fire active alerts; states of removed rules are dropped.
+// ReplaceRules atomically hot-updates the rule set using the legacy
+// unvalidated path: it performs the same all-at-once swap as ApplyRules but
+// emits no closure events and keeps no batch record. Surviving rule IDs keep
+// their states (pending progress and firing are preserved, so updates never
+// re-fire); states of removed rules and of series no longer matched by a
+// surviving selector are dropped.
+//
+// New code should prefer Evaluator.ApplyRules, which validates the whole batch
+// first, closes orphaned active alerts explicitly and records the change.
 func (e *Evaluator) ReplaceRules(rules []model.Rule) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.replaceRulesLocked(rules)
-}
-
-func (e *Evaluator) replaceRulesLocked(rules []model.Rule) {
-	cp := make([]model.Rule, len(rules))
-	copy(cp, rules)
-	sort.SliceStable(cp, func(i, j int) bool { return cp[i].ID < cp[j].ID })
-	keep := make(map[string]bool, len(cp))
-	for _, r := range cp {
-		keep[r.ID] = true
-	}
-	for k := range e.states {
-		rid := k
-		if i := indexSep(k); i >= 0 {
-			rid = k[:i]
-		}
-		if !keep[rid] {
-			delete(e.states, k)
-		}
-	}
-	e.rules = cp
+	// ts=0 is irrelevant for the legacy path: closure events it may produce
+	// are intentionally discarded below.
+	events, _ := e.swapRulesLocked(rules, e.now())
+	_ = events
 }
 
 func indexSep(k string) int {

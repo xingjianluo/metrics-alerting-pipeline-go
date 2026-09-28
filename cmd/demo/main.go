@@ -134,7 +134,10 @@ func main() {
 	fmt.Printf("post-reload repeat-eval events=%d state=%s (expect 0 events, firing kept)\n",
 		len(rep.Events), status)
 
-	fmt.Println("\n=== 6. Eviction: queries over dropped windows fail loudly ===")
+	fmt.Println("\n=== 6. Batch rule change management (validate / atomic switch / audit) ===")
+	demoBatchManagement(p, rules, c)
+
+	fmt.Println("\n=== 7. Eviction: queries over dropped windows fail loudly ===")
 	c.t = 1100
 	p.Tick()
 	if _, err := p.Query(0, 40, w, nil); err != nil {
@@ -143,4 +146,65 @@ func main() {
 	res, err := p.Query(1080, 1100, w, nil)
 	fmt.Printf("query [1080,1100) post-horizon: err=%v series=%d (empty retained range is a valid result)\n",
 		err, len(res.Series))
+}
+
+// demoBatchManagement walks one check-only failure, one rejected (atomic,
+// nothing changes) submit, one valid atomic batch with an auditable diff, and
+// a deletion that explicitly closes a tracked alert.
+func demoBatchManagement(p *pipeline.Pipeline, rules []model.Rule, c *clock) {
+	// At this point high_request_rate is firing (section 5). Audit a batch
+	// BEFORE applying it: the bad rule's problems are listed in one shot.
+	bad := rules[0]
+	bad.ID = "broken"
+	bad.WindowSeconds = 0 // illegal window
+	bad.AggField = "p99"  // illegal aggregation
+	invalid := []model.Rule{bad, bad}
+	fmt.Println("-- CheckRules (check-only, no mutation) --")
+	if verrs := p.CheckRules(invalid); verrs != nil {
+		fmt.Printf("dry-run found %d problem(s); rules/state untouched:\n  %s\n",
+			len(verrs.Errs), strings.ReplaceAll(verrs.Error(), "; ", "\n  "))
+	}
+
+	fmt.Println("-- SubmitRules invalid batch: all-or-nothing rejection --")
+	rej, verrs := p.SubmitRules(invalid, "demo-invalid")
+	if verrs != nil {
+		fmt.Printf("batch %s applied=%v (%d problem(s)); existing firing alert preserved\n",
+			rej.BatchID, rej.Applied(), len(verrs.Errs))
+	}
+
+	fmt.Println("-- SubmitRules valid batch: keep + add, atomic switch with record --")
+	added := rules[0]
+	added.ID = "high_request_rate_host_b"
+	added.Selector = model.Labels{"__name__": "http_requests", "host": "b"}
+	applied, verrs := p.SubmitRules([]model.Rule{rules[0], added}, "demo-valid")
+	if verrs != nil {
+		panic(verrs)
+	}
+	for _, ch := range applied.Changes {
+		fmt.Printf("batch %s @%d: rule=%s %s fields=%v\n",
+			applied.BatchID, applied.Ts, ch.RuleID, ch.Kind, ch.ChangedFields)
+	}
+	// Re-evaluating the same violating window must not duplicate firing.
+	rep, _ := p.Evaluate(60)
+	fmt.Printf("post-switch repeat-eval events=%d (expect 0: surviving firing not re-triggered)\n",
+		len(rep.Events))
+
+	fmt.Println("-- SubmitRules delete batch: active alerts closed with a reason --")
+	del, verrs := p.SubmitRules(nil, "demo-delete")
+	if verrs != nil {
+		panic(verrs)
+	}
+	if len(del.ClosedEvents) == 0 {
+		fmt.Println("no active alerts needed closure")
+	}
+	for _, a := range del.Affected {
+		fmt.Printf("batch %s CLOSED rule=%s labels=%v previous=%s: %s\n",
+			del.BatchID, a.RuleID, a.Labels, a.PreviousStatus, a.Reason)
+	}
+
+	fmt.Println("-- change history (newest first; rejected pushes are kept too) --")
+	for _, rec := range p.RuleChangeHistory() {
+		fmt.Printf("  %s applied=%v changes=%d closed=%d problems=%d\n",
+			rec.BatchID, rec.Applied(), len(rec.Changes), len(rec.ClosedEvents), len(rec.ValidationErrors))
+	}
 }
