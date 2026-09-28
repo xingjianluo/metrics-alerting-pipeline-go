@@ -30,19 +30,84 @@ type Skip struct {
 
 // Report is the outcome of one evaluation pass.
 type Report struct {
-	Ts      int64
+	Ts int64
+	// Version is the ruleset version the pass evaluated against; it bumps on
+	// every atomic ruleset switch, so a concurrent reader can prove the whole
+	// pass saw one consistent ruleset (mixed old/new rules are impossible).
+	Version int64
 	Events  []model.AlertEvent // transitions produced in this pass
 	States  []model.AlertState // snapshot of all tracked states
 	Skipped []Skip
 }
 
+// Closure is an alert explicitly concluded while switching rulesets: the rule
+// was deleted or its selector stopped covering the series. Pending/firing
+// alerts are never dropped silently — each yields an EventClosed event.
+type Closure struct {
+	RuleID string
+	Labels model.Labels
+	// ReasonCode is "rule_deleted" or "selector_narrowed".
+	ReasonCode string
+	Event      model.AlertEvent
+}
+
+// ApplyResult is the outcome of one atomic ruleset switch.
+type ApplyResult struct {
+	Ts       int64
+	Version  int64
+	Closures []Closure
+	States   []model.AlertState // snapshot right after the switch
+}
+
 // Evaluator evaluates rules and owns alert states.
 type Evaluator struct {
-	mu     sync.Mutex
-	rules  []model.Rule                 // ordered by ID for deterministic evaluation
-	states map[string]*model.AlertState // key: ruleID + "\x00" + fingerprint
-	reader AggReader
-	now    func() int64
+	mu      sync.Mutex
+	rules   []model.Rule                 // ordered by ID for deterministic evaluation
+	states  map[string]*model.AlertState // key: ruleID + "\x00" + fingerprint
+	reader  AggReader
+	now     func() int64
+	version int64 // ruleset version; bumped atomically on every ruleset switch
+}
+
+// Version returns the ruleset version the evaluator is currently on. It
+// starts at 0 and bumps by one per atomic switch (ReplaceRules / ApplyRuleset).
+func (e *Evaluator) Version() int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.version
+}
+
+// States returns a snapshot copy of all tracked alert states.
+func (e *Evaluator) States() []model.AlertState {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.snapshotLocked()
+}
+
+// Reader exposes the aggregate reader the evaluator uses (mainly for building
+// throwaway simulation evaluators in check-only previews).
+func (e *Evaluator) Reader() AggReader { return e.reader }
+
+// SeedState inserts a copy of an existing state keyed by (RuleID, labels).
+// It is used to clone live state into a check-only simulation evaluator; it
+// never touches the receiver's live state.
+func (e *Evaluator) SeedState(st model.AlertState) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cp := st
+	cp.Labels = cloneLabels(st.Labels)
+	e.states[stateKey(st.RuleID, st.Labels.Fingerprint())] = &cp
+}
+
+// Snapshot returns the current rules (sorted by ID), ruleset version and all
+// tracked states in one atomic read under the evaluator lock, so callers
+// never combine rules from one ruleset version with states from another.
+func (e *Evaluator) Snapshot() (rules []model.Rule, version int64, states []model.AlertState) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rules = make([]model.Rule, len(e.rules))
+	copy(rules, e.rules)
+	return rules, e.version, e.snapshotLocked()
 }
 
 // NewEvaluator constructs an evaluator with an initial rule set.
@@ -117,7 +182,7 @@ func (e *Evaluator) Eval(evalTs int64) (Report, error) {
 	if evalTs == 0 {
 		evalTs = e.now()
 	}
-	rep := Report{Ts: evalTs}
+	rep := Report{Ts: evalTs, Version: e.version}
 
 	for _, rule := range e.rules {
 		if rule.WindowSeconds <= 0 {
@@ -287,9 +352,16 @@ func (e *Evaluator) snapshotLocked() []model.AlertState {
 	return out
 }
 
-// ReplaceRules atomically hot-updates the rule set. States belonging to
-// surviving rule IDs are preserved so updates never lose pending progress or
-// re-fire active alerts; states of removed rules are dropped.
+// ReplaceRules atomically hot-updates the rule set, preserving the original
+// hot-reload semantics: states of surviving rule IDs are kept (no lost
+// pending progress, no re-fire), states of removed rule IDs are dropped
+// silently with no closure events.
+//
+// New code that deletes rules or narrows selectors should prefer
+// Evaluator.ApplyRuleset (or change.Manager.Commit), which additionally
+// validates, closes orphaned pending/firing alerts explicitly and records the
+// batch. ReplaceRules stays for backward compatibility with callers that
+// already accepted silent state cleanup.
 func (e *Evaluator) ReplaceRules(rules []model.Rule) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -314,6 +386,136 @@ func (e *Evaluator) replaceRulesLocked(rules []model.Rule) {
 		}
 	}
 	e.rules = cp
+	e.version++
+}
+
+// ApplyRuleset atomically switches to the given complete ruleset and performs
+// reconciliation while holding the same lock used by Eval, so a concurrent
+// evaluation can never observe a half-switched set:
+//
+//   - states of surviving rules are preserved (no double fire, no lost track);
+//   - pending/firing states whose rule was deleted, or whose rule's selector
+//     no longer covers their series, are explicitly closed (EventClosed with
+//     a reason) and removed;
+//   - re-adding / re-widening a rule later starts from a clean state, because
+//     the closed state was deleted rather than left dormant.
+//
+// Callers are expected to have validated the ruleset beforehand (see package
+// change); ApplyRuleset itself does not validate rule contents.
+//
+// expectVersion enables optimistic concurrency: the switch proceeds only when
+// the live ruleset version still equals expectVersion (the version the caller
+// planned against). If another switch happened in between, ok is false with
+// nothing applied, letting the caller re-plan against the fresh ruleset.
+// Pass expectVersion < 0 to apply unconditionally.
+func (e *Evaluator) ApplyRuleset(rules []model.Rule, applyTs, expectVersion int64) (res ApplyResult, ok bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if expectVersion >= 0 && e.version != expectVersion {
+		return ApplyResult{Ts: applyTs, Version: e.version}, false
+	}
+
+	if applyTs == 0 {
+		applyTs = e.now()
+	}
+
+	// Index old and new rules by ID and normalize/copy the incoming set.
+	oldByID := make(map[string]model.Rule, len(e.rules))
+	for _, r := range e.rules {
+		oldByID[r.ID] = r
+	}
+	next := make([]model.Rule, len(rules))
+	copy(next, rules)
+	sort.SliceStable(next, func(i, j int) bool { return next[i].ID < next[j].ID })
+	newByID := make(map[string]model.Rule, len(next))
+	for _, r := range next {
+		newByID[r.ID] = r
+	}
+
+	// Reconcile tracked states against the incoming ruleset. Iteration order
+	// over the state map is not deterministic, so collect and sort afterwards.
+	var closures []Closure
+	var removed []string
+	for key, st := range e.states {
+		rid := key
+		if i := indexSep(key); i >= 0 {
+			rid = key[:i]
+		}
+		old := oldByID[rid]
+		nr, survives := newByID[rid]
+
+		switch {
+		case !survives:
+			// Rule deleted from the ruleset.
+			if st.Status == model.StatusPending || st.Status == model.StatusFiring {
+				closures = append(closures, Closure{
+					RuleID:     rid,
+					Labels:     cloneLabels(st.Labels),
+					ReasonCode: "rule_deleted",
+					Event: model.AlertEvent{
+						Type: model.EventClosed, RuleID: rid,
+						Labels: cloneLabels(st.Labels), Ts: applyTs,
+						Observed: st.LastObserved, Threshold: old.Threshold, Op: old.Op,
+						Reason: fmt.Sprintf(
+							"rule %q deleted by atomic ruleset switch at ts=%d: %s alert closed explicitly instead of vanishing (last observed %s)",
+							rid, applyTs, st.Status, model.FormatValue(st.LastObserved)),
+					},
+				})
+			}
+			removed = append(removed, key)
+
+		case !nr.Selector.Match(st.Labels):
+			// Rule survives but no longer covers this series.
+			if st.Status == model.StatusPending || st.Status == model.StatusFiring {
+				closures = append(closures, Closure{
+					RuleID:     rid,
+					Labels:     cloneLabels(st.Labels),
+					ReasonCode: "selector_narrowed",
+					Event: model.AlertEvent{
+						Type: model.EventClosed, RuleID: rid,
+						Labels: cloneLabels(st.Labels), Ts: applyTs,
+						Observed: st.LastObserved, Threshold: nr.Threshold, Op: nr.Op,
+						Reason: fmt.Sprintf(
+							"rule %q selector narrowed by update at ts=%d no longer matches series %s: %s alert closed explicitly (last observed %s)",
+							rid, applyTs, st.Labels.Fingerprint(), st.Status, model.FormatValue(st.LastObserved)),
+					},
+				})
+			}
+			removed = append(removed, key)
+		}
+	}
+	for _, k := range removed {
+		delete(e.states, k)
+	}
+
+	sort.Slice(closures, func(i, j int) bool {
+		if closures[i].RuleID != closures[j].RuleID {
+			return closures[i].RuleID < closures[j].RuleID
+		}
+		return closures[i].Labels.Fingerprint() < closures[j].Labels.Fingerprint()
+	})
+
+	// Single commit point: rules and the reconciled state map become visible
+	// together. Eval holds the same mutex, so no pass can observe a mix.
+	e.rules = next
+	e.version++
+
+	return ApplyResult{
+		Ts:       applyTs,
+		Version:  e.version,
+		Closures: closures,
+		States:   e.snapshotLocked(),
+	}, true
+}
+
+// cloneLabels returns a copy so records/events never alias mutable maps.
+func cloneLabels(ls model.Labels) model.Labels {
+	cp := make(model.Labels, len(ls))
+	for k, v := range ls {
+		cp[k] = v
+	}
+	return cp
 }
 
 func indexSep(k string) int {

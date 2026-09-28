@@ -158,7 +158,11 @@ type EventType string
 const (
 	EventPending  EventType = "pending"  // resolved -> pending
 	EventFiring   EventType = "firing"   // pending -> firing
-	EventResolved EventType = "resolved" // firing/pending -> resolved
+	EventResolved EventType = "resolved" // firing/pending -> resolved (condition recovered)
+	// EventClosed is a terminal, administratively driven ending: the rule was
+	// removed or its selector stopped covering the series. The tracked alert
+	// is concluded explicitly with a reason, never dropped silently.
+	EventClosed EventType = "closed"
 )
 
 // Event is an immutable transition record with the reason behind it.
