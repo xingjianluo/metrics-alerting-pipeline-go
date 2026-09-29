@@ -302,9 +302,10 @@ func (e *Evaluator) snapshotLocked() []model.AlertState {
 func (e *Evaluator) ReplaceRules(rules []model.Rule) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	// ts=0 is irrelevant for the legacy path: closure events it may produce
-	// are intentionally discarded below.
-	events, _ := e.swapRulesLocked(rules, e.now())
+	// The legacy path reconciles physical state the same way (kept states kept,
+	// orphaned states dropped) but passes no change set and discards the
+	// closure events/audit lists it may produce.
+	events, _, _ := e.swapRulesLocked(rules, e.now(), nil)
 	_ = events
 }
 

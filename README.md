@@ -11,7 +11,8 @@
 - 规则热更新保留存活规则的状态，不丢告警、不重复触发；
 - 求值在互斥锁内串行完成，并发调用结论不串扰；
 - **规则批量变更管理**：整批先校验（一条不合格整批不生效）、原子前后切换、
-  被移除告警显式收尾、每批改动可查询可追溯。
+  每条受影响告警都有明确结局（继续跟踪 `Kept` / 显式收尾 `Closed`，两类不混、
+  不漏），每批改动可查询可追溯。
 
 ## 1. 快速开始
 
@@ -167,23 +168,35 @@ Query(start, end, granularitySeconds, selector) (*QueryResult, error)
   存活状态一起带走」的中间态。
 - 切换与状态对齐仍按**规则 ID + 选择器**进行（见 8.3）。
 
-### 8.3 被移除/不再匹配的告警显式收尾，不重复触发、不漏跟踪
+### 8.3 切换对账：每条受影响告警都有明确结局，两类绝不混淆
 
-切换时对每条仍在跟踪的告警分类处理：
+「受影响告警」的口径：提交时**仍在跟踪（`pending` 或 `firing`）**、且其所属规则在本批中被
+**新增 / 修改 / 删除**的告警。规则被新增时还没有任何旧状态，所以新增规则不会产生
+受影响告警；`unchanged` 规则下的告警本批没有被碰到，也不计入。已经 `resolved` 的
+惰性状态不属于「在跟踪」，按老规则静默清理、不出现在记录里。
 
-| 情况 | 处理 |
-|---|---|
-| 规则 ID 保留、新选择器仍匹配该序列 | 状态原样保留（pending 进度、firing 不丢），**不会重复触发** |
-| 规则 ID 保留、但新选择器不再匹配该序列 | 活跃告警发出 `closed` 事件（原因 `rule updated and no longer matches this series`），状态移除 |
-| 规则 ID 被删除 | 其 pending/firing 告警发出 `closed` 事件（原因 `rule deleted by batch change`），状态移除；已 resolved 的惰性状态静默清理 |
-| 规则 ID 为新增 | 不建状态，下次求值从 `resolved` 冷启动 |
+对每条受影响告警，记录都给出**提交时快照**（规则、序列标签、`previous status` 是
+待触发还是已触发、`streak`、最后观测值）以及两个互斥结局之一：
 
+| 结局 | 结构化表示 | 含义与原因 |
+|---|---|---|
+| **继续跟踪** | `Kept[]`：`Outcome=tracked`，`Conclusion=still_tracked`，`Reason="rule updated but selector still covers this series; state preserved"` | 规则的关键配置改了，但**新选择器仍覆盖该序列**（含只改阈值/窗口/pending 等、选择器不变）。状态原样保留：pending 进度不丢、firing 不重复触发 |
+| **收尾** | `Closed[]`（与 `ClosedEvents[]` 一一对应）：`Outcome=closed` | 管理性收尾，必带明确结论与原因：`Conclusion=closed_rule_deleted`（规则被删除，原因 `rule deleted by batch change`）或 `Conclusion=closed_no_longer_matches`（选择器改到不再覆盖该序列，原因 `rule updated and no longer matches this series`）；同时发一条 `closed` 事件并移除状态 |
+
+- 两类放在 `BatchReport` 的两个独立字段 `Kept` / `Closed` 里，**不混在一起**；
+  便捷合并视图用 `BatchReport.AffectedAlerts()`（先 Kept 后 Closed，每条自带 `Outcome`）。
+- 这保证了「只改关键配置、选择器仍覆盖原序列」的批次也能查到碰到了哪些还在跟踪的
+  告警——以前这类批次记录里只剩规则改动、告警一条都看不到（
+  `alert.TestBatchConfigOnlyChangeKeepsTracking` /
+  `change.TestConfigOnlySubmitKeepsTrackedRecord`）。
 - `closed` 是一种**管理性收尾结论**（非数据驱动状态机迁移），事件里带
   `之前状态 / streak / 最后观测值 / 原因`，告警不会无声无息消失。
 - 规则之后被加回来或改回来时，由于旧状态已移除，**从干净状态重新开始**，
-  不会继承已收尾的旧进度（`alert.TestBatchReaddStartsClean`）。
+  不会继承已收尾的旧进度（`alert.TestBatchReaddStartsClean`、
+  `alert.TestBatchMixedAddModifyDelete` 的 readd 段）。
 - 仍然有效的告警在切换后对同一窗口重复求值**不会再触发一遍**，本该继续跟踪的
-  序列也不漏（`alert.TestBatchSelectorNarrow`）。
+  序列也不漏（`alert.TestBatchSelectorNarrow`、
+  `alert.TestBatchMixedAddModifyDelete`）。
 
 ### 8.4 每批改动留下可查询记录
 
@@ -193,11 +206,20 @@ Query(start, end, granularitySeconds, selector) (*QueryResult, error)
 BatchID, Ts
 Changes[]      // 每条规则：kind=added|modified|deleted|unchanged
                // modified 含改动前/后关键配置与 ChangedFields
-ClosedEvents[] // 本批收尾掉的活跃告警（显式结论与原因）
-Affected[]     // 与 ClosedEvents 对应的结构化视图（规则/序列/前状态/原因）
+Kept[]         // 继续跟踪的受影响告警（Outcome=tracked / conclusion=still_tracked）
+Closed[]       // 收尾的受影响告警（Outcome=closed + 明确结论/原因）
+ClosedEvents[] // 与 Closed[] 一一对应的 closed 状态事件
 ValidationErrors // 被拒批次的全部问题（被拒同样留痕，Applied()==false）
 ```
 
+- `Kept[]` 与 `Closed[]` 是两个**互斥且各自明确**的分组（口径见 8.3）；
+  `AffectedAlerts()` 返回二者的合并视图，每条都带 `Outcome/Conclusion/Reason`。
+  每条结构化记录含 `RuleID / Labels / PreviousStatus(pending|firing) /
+  Streak / LastObserved`，即「哪条规则下的哪条序列、提交时是待触发还是已触发、
+  最后是继续跟踪还是因什么被收尾」。
+- 一批里同时有新增、修改、删除、收窄时，规则级 `Changes` 与告警级 `Kept/Closed`
+  对得上账：仍覆盖的进 `Kept` 且不重复触发，失配/删除的进 `Closed` 不凭空消失，
+  新增规则不带旧告警、加回来时干净重启（`alert.TestBatchMixedAddModifyDelete`）。
 - `RuleChangeHistory()` 按**最新在前**返回所有记录（含被拒批次）；
   `RuleChangeBatch(id)` 按批次 ID 精确查询。
 - `SubmitRules` 的第二个参数是**幂等键**：相同 key 的重试返回首次的批次记录，
@@ -221,6 +243,21 @@ go test ./... -v                      # 查看带输入样本与判定依据的�
 go run ./cmd/demo                     # 端到端演示（第 6 节即批量变更管理）
 ```
 
+本地专门复现「批次受影响告警对账」的几个边界（均带输入与判定日志）：
+
+```bash
+# 只改关键配置、选择器仍覆盖：pending/firing 都应出现在 Kept 且不重复触发
+go test ./alert/ -run TestBatchConfigOnlyChangeKeepsTracking -v
+# 选择器收窄：失配进 Closed(closed_no_longer_matches)，仍匹配进 Kept
+go test ./alert/ -run TestBatchSelectorNarrow -v
+# 整批删除：全部进 Closed(closed_rule_deleted)，Kept 为空
+go test ./alert/ -run TestBatchDeleteClosesActiveAlerts -v
+# 一批混合新增/修改/删除/收窄 + 加回来干净重启
+go test ./alert/ -run TestBatchMixedAddModifyDelete -v
+# 并发求值只能看到整批旧或整批新（录制型 reader 还原每次求值查询的整组选择器）
+go test -race ./change/ -run TestConcurrentEvalSeesWholeRuleSet -v
+```
+
 本地最小验证批量变更管理的调用方式：
 
 ```go
@@ -236,9 +273,11 @@ if verrs := p.CheckRules(candidate); verrs != nil {
 rec, verrs := p.SubmitRules(candidate, "change-ticket-123")
 if verrs != nil { /* 整批未生效，规则/状态原样 */ }
 
-// 3) 回看这批动了什么、收尾了哪些告警
+// 3) 回看这批动了什么：规则级增删改 + 受影响告警的两类结局（互不混淆）
 for _, ch := range rec.Changes { /* added/modified/deleted + 前后配置 */ }
-for _, a := range rec.Affected { /* rule/labels/previous/reason */ }
+for _, k := range rec.Kept { /* 继续跟踪：k.PreviousStatus / k.Conclusion / k.Reason */ }
+for _, c := range rec.Closed { /* 收尾：c.Conclusion(closed_*) / c.Reason */ }
+// 或一次拿全：rec.AffectedAlerts()（每条自带 Outcome=tracked|closed）
 
 // 4) 事后查询任意批次
 history := p.RuleChangeHistory()   // 最新在前，含被拒批次
@@ -260,13 +299,16 @@ one, ok := p.RuleChangeBatch(rec.BatchID)
 | `alert.TestValidateBatchListsAllProblems` | 只检查入口一次列清整批问题（重名/窗口/口径/运算符/阈值） |
 | `alert.TestInvalidBatchChangesNothing` | **整批非法时不生效**：规则与 firing 状态提交前后一致 |
 | `alert.TestBatchDiffRecordsAddModifyDelete` | 批次记录：新增/修改/删除/未变 + 改动前后关键配置 |
-| `alert.TestBatchDeleteClosesActiveAlerts` | **删规则时 pending/firing 显式收尾**，resolved 静默清理 |
-| `alert.TestBatchSelectorNarrow` | 选择器收窄：失配序列收尾、仍匹配序列不重复触发 |
+| `alert.TestBatchDeleteClosesActiveAlerts` | **整批删除**：pending/firing 显式收尾（`Closed`，含结论+原因），resolved 静默清理，`Kept` 为空 |
+| `alert.TestBatchSelectorNarrow` | **选择器收窄**：失配序列收尾、仍匹配序列进 `Kept` 继续跟踪且不重复触发，两类不重叠 |
+| `alert.TestBatchConfigOnlyChangeKeepsTracking` | **只改关键配置、选择器仍覆盖**：pending/firing 都在 `Kept` 可见，状态保留、不重复触发 |
+| `alert.TestBatchMixedAddModifyDelete` | **一批混合增删改+收窄**：`Changes` 与 `Kept/Closed` 对账一致，覆盖的不重复触发、移除的不消失、加回来干净重启 |
 | `alert.TestBatchReaddStartsClean` | 规则加回来从干净状态重启，不继承已收尾进度 |
 | `change.TestCheckDoesNotMutate` | 只检查不改规则、不写历史 |
 | `change.TestSubmitAuditRecordAndIdempotency` | 被拒/成功留痕、按 ID 查询、幂等重试不重复应用 |
-| `change.TestDeleteBatchRecordsAffectedAlerts` | 批次记录列出受影响的在跟踪告警 |
-| `change.TestConcurrentEvalSeesWholeRuleSet` | **并发求值中整批切换**：无撕裂规则集、firing 仅一次（`-race`） |
+| `change.TestDeleteBatchRecordsAffectedAlerts` | 删除批次记录把收尾告警放进 `Closed`、`Kept` 为空、`AffectedAlerts()` 合并视图 |
+| `change.TestConfigOnlySubmitKeepsTrackedRecord` | 只改阈值（仍违规）：firing 告警以 `tracked/still_tracked` 留痕、不重复触发，历史记录同样保留两分组 |
+| `change.TestConcurrentEvalSeesWholeRuleSet` | **并发求值中整批切换**：用录制型 reader 还原每次求值实际查询的整组选择器，断言每次都是「整批旧或整批新」、无中间态；持续覆盖的锚规则对同一窗口只触发一次（`-race`） |
 | `pipeline.TestBatchRuleChangeEndToEnd` | 门面端到端：dry-run→拒绝→原子应用→删除收尾→历史→旧接口兼容 |
 | `pipeline.TestEndToEnd` | 确定性脚本端到端：11 接受 / 2 去重、聚合值、告警生命周期、淘汰查询报错 |
 

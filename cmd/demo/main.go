@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/xingjianluo/metrics-alerting-pipeline-go/alert"
 	"github.com/xingjianluo/metrics-alerting-pipeline-go/model"
 	"github.com/xingjianluo/metrics-alerting-pipeline-go/pipeline"
 	"github.com/xingjianluo/metrics-alerting-pipeline-go/storage"
@@ -180,31 +181,58 @@ func demoBatchManagement(p *pipeline.Pipeline, rules []model.Rule, c *clock) {
 	if verrs != nil {
 		panic(verrs)
 	}
-	for _, ch := range applied.Changes {
-		fmt.Printf("batch %s @%d: rule=%s %s fields=%v\n",
-			applied.BatchID, applied.Ts, ch.RuleID, ch.Kind, ch.ChangedFields)
-	}
+	printBatchChanges(applied)
 	// Re-evaluating the same violating window must not duplicate firing.
 	rep, _ := p.Evaluate(60)
 	fmt.Printf("post-switch repeat-eval events=%d (expect 0: surviving firing not re-triggered)\n",
 		len(rep.Events))
 
-	fmt.Println("-- SubmitRules delete batch: active alerts closed with a reason --")
+	fmt.Println("-- SubmitRules config-only modify: threshold changed, selector still covers --")
+	// The firing alert on host a is still covered, so it must show up as a
+	// tracked (kept) alert, not vanish from the batch record nor re-fire.
+	modified := rules[0]
+	modified.Threshold = 3 // critical config change; selector for host a unchanged
+	mod, verrs := p.SubmitRules([]model.Rule{modified, added}, "demo-modify")
+	if verrs != nil {
+		panic(verrs)
+	}
+	printBatchChanges(mod)
+	printAffected("still tracked", mod.Kept)
+	printAffected("closed", mod.Closed)
+	rep, _ = p.Evaluate(60)
+	fmt.Printf("post-modify repeat-eval events=%d (expect 0: kept firing not re-triggered)\n",
+		len(rep.Events))
+
+	fmt.Println("-- SubmitRules delete batch: active alerts closed with a conclusion+reason --")
 	del, verrs := p.SubmitRules(nil, "demo-delete")
 	if verrs != nil {
 		panic(verrs)
 	}
-	if len(del.ClosedEvents) == 0 {
-		fmt.Println("no active alerts needed closure")
-	}
-	for _, a := range del.Affected {
-		fmt.Printf("batch %s CLOSED rule=%s labels=%v previous=%s: %s\n",
-			del.BatchID, a.RuleID, a.Labels, a.PreviousStatus, a.Reason)
-	}
+	printBatchChanges(del)
+	printAffected("still tracked", del.Kept)
+	printAffected("closed", del.Closed)
 
 	fmt.Println("-- change history (newest first; rejected pushes are kept too) --")
 	for _, rec := range p.RuleChangeHistory() {
-		fmt.Printf("  %s applied=%v changes=%d closed=%d problems=%d\n",
-			rec.BatchID, rec.Applied(), len(rec.Changes), len(rec.ClosedEvents), len(rec.ValidationErrors))
+		fmt.Printf("  %s applied=%v changes=%d kept=%d closed=%d problems=%d\n",
+			rec.BatchID, rec.Applied(), len(rec.Changes), len(rec.Kept), len(rec.Closed), len(rec.ValidationErrors))
+	}
+}
+
+func printBatchChanges(rec alert.BatchReport) {
+	for _, ch := range rec.Changes {
+		fmt.Printf("batch %s @%d: rule=%s %s fields=%v\n",
+			rec.BatchID, rec.Ts, ch.RuleID, ch.Kind, ch.ChangedFields)
+	}
+}
+
+func printAffected(group string, as []alert.AffectedAlert) {
+	if len(as) == 0 {
+		fmt.Printf("  [%s] none\n", group)
+	}
+	for _, a := range as {
+		fmt.Printf("  [%s] %s rule=%s labels=%v previous=%s streak=%d observed=%s conclusion=%s reason=%s\n",
+			group, a.Outcome, a.RuleID, a.Labels, a.PreviousStatus, a.Streak,
+			model.FormatValue(a.LastObserved), a.Conclusion, a.Reason)
 	}
 }
