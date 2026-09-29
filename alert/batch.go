@@ -30,19 +30,36 @@ type RuleChange struct {
 	ChangedFields []string
 }
 
-// AffectedAlert records one tracked alert whose lifecycle was ended by a
-// batch change (rule deleted, or selector narrowed past its series).
+// AlertOutcome is the lifecycle conclusion of one active alert touched by a
+// batch: it either remains under active tracking or receives an administrative
+// closure.
+type AlertOutcome string
+
+const (
+	// AlertOutcomeContinued means the alert was pending/firing at submission and
+	// the surviving rule's new selector still covers the series. Its state is
+	// retained without being re-triggered.
+	AlertOutcomeContinued AlertOutcome = "continued"
+	// AlertOutcomeClosed means the batch removed the alert from active tracking.
+	AlertOutcomeClosed AlertOutcome = "closed"
+)
+
+// AffectedAlert records one active (pending/firing) alert touched by a batch
+// change. Resolved inert states are not considered affected alerts.
 type AffectedAlert struct {
 	RuleID         string
 	Labels         model.Labels
 	PreviousStatus model.AlertStatus
-	Reason         string
+	Outcome        AlertOutcome
+	// Reason explains why the alert continues or why it was closed.
+	Reason string
 }
 
-// Closure reasons emitted in EventClosed records.
+// Closure and continuation reasons emitted in the audit record.
 const (
 	CloseReasonRuleDeleted = "rule deleted by batch change"
 	CloseReasonNoMatch     = "rule updated and no longer matches this series"
+	ContinueReasonMatched  = "rule critical configuration updated and new selector still matches this series"
 )
 
 // BatchReport is the auditable outcome record of one submitted batch.
@@ -53,8 +70,11 @@ type BatchReport struct {
 	// ClosedEvents are the administrative closure transitions (pending/firing
 	// alerts that got an explicit ending instead of vanishing silently).
 	ClosedEvents []model.AlertEvent
-	// Affected is the structured parallel view of ClosedEvents (query-friendly).
-	Affected []AffectedAlert
+	// ContinuedAlerts are active alerts under modified rules whose post-change
+	// selector still covers the series. Their pending/firing states are retained.
+	ContinuedAlerts []AffectedAlert
+	// ClosedAlerts are the structured parallel view of ClosedEvents.
+	ClosedAlerts []AffectedAlert
 	// ValidationErrors is populated for a rejected batch (applied==false); it
 	// lists every problem found so a failed push is itself auditable.
 	ValidationErrors []ValidationError
@@ -190,7 +210,7 @@ func closeEvent(ruleID string, ls model.Labels, ts int64, st *model.AlertState, 
 //   - added rule ID: no state, starts clean on next evaluation.
 //
 // Caller holds e.mu.
-func (e *Evaluator) swapRulesLocked(next []model.Rule, ts int64) ([]model.AlertEvent, []AffectedAlert) {
+func (e *Evaluator) swapRulesLocked(old, next []model.Rule, ts int64) ([]model.AlertEvent, []AffectedAlert, []AffectedAlert) {
 	cp := make([]model.Rule, len(next))
 	copy(cp, next)
 	sort.SliceStable(cp, func(i, j int) bool { return cp[i].ID < cp[j].ID })
@@ -198,17 +218,33 @@ func (e *Evaluator) swapRulesLocked(next []model.Rule, ts int64) ([]model.AlertE
 	for _, r := range cp {
 		nextByID[r.ID] = r
 	}
+	oldByID := make(map[string]model.Rule, len(old))
+	for _, r := range old {
+		oldByID[r.ID] = r
+	}
 
-	var events []model.AlertEvent
-	var affected []AffectedAlert
+	events := make([]model.AlertEvent, 0)
+	continued := make([]AffectedAlert, 0)
+	closed := make([]AffectedAlert, 0)
 	for key, st := range e.states {
 		rid := key
 		if i := indexSep(key); i >= 0 {
 			rid = key[:i]
 		}
 		nr, survives := nextByID[rid]
-		labelsMatch := survives && (nr.Selector == nil || st.Labels.Match(nr.Selector))
-		if survives && labelsMatch {
+		active := st.Status == model.StatusPending || st.Status == model.StatusFiring
+
+		if survives && st.Labels.Match(nr.Selector) {
+			or := oldByID[rid]
+			if active && !ruleEqual(or, nr) {
+				continued = append(continued, AffectedAlert{
+					RuleID:         rid,
+					Labels:         cloneLabels(st.Labels),
+					PreviousStatus: st.Status,
+					Outcome:        AlertOutcomeContinued,
+					Reason:         ContinueReasonMatched,
+				})
+			}
 			continue // tracked alert stays tracked under the updated rule
 		}
 
@@ -216,13 +252,13 @@ func (e *Evaluator) swapRulesLocked(next []model.Rule, ts int64) ([]model.AlertE
 		if survives {
 			reason = CloseReasonNoMatch
 		}
-		active := st.Status == model.StatusPending || st.Status == model.StatusFiring
 		if active {
 			events = append(events, closeEvent(rid, st.Labels, ts, st, reason))
-			affected = append(affected, AffectedAlert{
+			closed = append(closed, AffectedAlert{
 				RuleID:         rid,
 				Labels:         cloneLabels(st.Labels),
 				PreviousStatus: st.Status,
+				Outcome:        AlertOutcomeClosed,
 				Reason:         reason,
 			})
 		}
@@ -230,7 +266,7 @@ func (e *Evaluator) swapRulesLocked(next []model.Rule, ts int64) ([]model.AlertE
 	}
 
 	e.rules = cp
-	return events, affected
+	return events, continued, closed
 }
 
 func cloneLabels(ls model.Labels) model.Labels {
@@ -239,6 +275,17 @@ func cloneLabels(ls model.Labels) model.Labels {
 		cp[k] = v
 	}
 	return cp
+}
+
+// sortAffectedAlerts orders an affected-alert view deterministically by
+// (rule ID, series fingerprint).
+func sortAffectedAlerts(xs []AffectedAlert) {
+	sort.Slice(xs, func(i, j int) bool {
+		if xs[i].RuleID != xs[j].RuleID {
+			return xs[i].RuleID < xs[j].RuleID
+		}
+		return xs[i].Labels.Fingerprint() < xs[j].Labels.Fingerprint()
+	})
 }
 
 // ApplyRules validates the whole batch and, only if every rule is valid,
@@ -266,28 +313,25 @@ func (e *Evaluator) ApplyRules(rules []model.Rule, batchID string, ts int64) (Ba
 		ts = e.now()
 	}
 	old := e.rules
-	events, affected := e.swapRulesLocked(rules, ts)
+	events, continued, closed := e.swapRulesLocked(old, rules, ts)
 
-	// Deterministic ordering of closures for the audit record.
+	// Deterministic ordering for the audit record.
 	sort.Slice(events, func(i, j int) bool {
 		if events[i].RuleID != events[j].RuleID {
 			return events[i].RuleID < events[j].RuleID
 		}
 		return events[i].Labels.Fingerprint() < events[j].Labels.Fingerprint()
 	})
-	sort.Slice(affected, func(i, j int) bool {
-		if affected[i].RuleID != affected[j].RuleID {
-			return affected[i].RuleID < affected[j].RuleID
-		}
-		return affected[i].Labels.Fingerprint() < affected[j].Labels.Fingerprint()
-	})
+	sortAffectedAlerts(continued)
+	sortAffectedAlerts(closed)
 
 	return BatchReport{
-		BatchID:      batchID,
-		Ts:           ts,
-		Changes:      diffRules(old, e.rules),
-		ClosedEvents: events,
-		Affected:     affected,
-		applied:      true,
+		BatchID:         batchID,
+		Ts:              ts,
+		Changes:         diffRules(old, e.rules),
+		ClosedEvents:    events,
+		ContinuedAlerts: continued,
+		ClosedAlerts:    closed,
+		applied:         true,
 	}, nil
 }

@@ -30,7 +30,11 @@ type Skip struct {
 
 // Report is the outcome of one evaluation pass.
 type Report struct {
-	Ts      int64
+	Ts int64
+	// Rules is the complete rule-set snapshot used by this evaluation pass. It is
+	// captured while holding the evaluator lock, so concurrent tests can prove a
+	// pass saw either the whole old batch or the whole new batch.
+	Rules   []model.Rule
 	Events  []model.AlertEvent // transitions produced in this pass
 	States  []model.AlertState // snapshot of all tracked states
 	Skipped []Skip
@@ -120,9 +124,9 @@ func (e *Evaluator) Eval(evalTs int64) (Report, error) {
 	if evalTs == 0 {
 		evalTs = e.now()
 	}
-	rep := Report{Ts: evalTs}
+	rep := Report{Ts: evalTs, Rules: e.snapshotRulesLocked()}
 
-	for _, rule := range e.rules {
+	for _, rule := range rep.Rules {
 		if rule.WindowSeconds <= 0 {
 			rep.Skipped = append(rep.Skipped, Skip{RuleID: rule.ID, Ts: evalTs, Reason: "WindowSeconds<=0"})
 			continue
@@ -276,6 +280,14 @@ func event(t model.EventType, rule model.Rule, ls model.Labels, ts int64, v floa
 	}
 }
 
+// snapshotRulesLocked returns a copy of the current rule slice. Selectors are
+// treated as immutable inputs, so label maps are shared.
+func (e *Evaluator) snapshotRulesLocked() []model.Rule {
+	out := make([]model.Rule, len(e.rules))
+	copy(out, e.rules)
+	return out
+}
+
 // snapshotLocked returns all states ordered by (ruleID, fingerprint).
 func (e *Evaluator) snapshotLocked() []model.AlertState {
 	keys := make([]string, 0, len(e.states))
@@ -302,9 +314,9 @@ func (e *Evaluator) snapshotLocked() []model.AlertState {
 func (e *Evaluator) ReplaceRules(rules []model.Rule) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	// ts=0 is irrelevant for the legacy path: closure events it may produce
+	// ts=0 is irrelevant for the legacy path: closure records it may produce
 	// are intentionally discarded below.
-	events, _ := e.swapRulesLocked(rules, e.now())
+	events, _, _ := e.swapRulesLocked(e.rules, rules, e.now())
 	_ = events
 }
 

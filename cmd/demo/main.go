@@ -184,6 +184,26 @@ func demoBatchManagement(p *pipeline.Pipeline, rules []model.Rule, c *clock) {
 		fmt.Printf("batch %s @%d: rule=%s %s fields=%v\n",
 			applied.BatchID, applied.Ts, ch.RuleID, ch.Kind, ch.ChangedFields)
 	}
+	fmt.Printf("batch %s affected active alerts: continued=%d closed=%d\n",
+		applied.BatchID, len(applied.ContinuedAlerts), len(applied.ClosedAlerts))
+
+	fmt.Println("-- SubmitRules config-only batch: firing alert continues, selector unchanged --")
+	updated := rules[0]
+	updated.Threshold = 3
+	configOnly, verrs := p.SubmitRules([]model.Rule{updated, added}, "demo-config-only")
+	if verrs != nil {
+		panic(verrs)
+	}
+	for _, ch := range configOnly.Changes {
+		fmt.Printf("batch %s @%d: rule=%s %s fields=%v\n",
+			configOnly.BatchID, configOnly.Ts, ch.RuleID, ch.Kind, ch.ChangedFields)
+	}
+	for _, a := range configOnly.ContinuedAlerts {
+		fmt.Printf("batch %s CONTINUED rule=%s labels=%v previous=%s: %s\n",
+			configOnly.BatchID, a.RuleID, a.Labels, a.PreviousStatus, a.Reason)
+	}
+	fmt.Printf("batch %s affected active alerts: continued=%d closed=%d\n",
+		configOnly.BatchID, len(configOnly.ContinuedAlerts), len(configOnly.ClosedAlerts))
 	// Re-evaluating the same violating window must not duplicate firing.
 	rep, _ := p.Evaluate(60)
 	fmt.Printf("post-switch repeat-eval events=%d (expect 0: surviving firing not re-triggered)\n",
@@ -197,14 +217,15 @@ func demoBatchManagement(p *pipeline.Pipeline, rules []model.Rule, c *clock) {
 	if len(del.ClosedEvents) == 0 {
 		fmt.Println("no active alerts needed closure")
 	}
-	for _, a := range del.Affected {
+	for _, a := range del.ClosedAlerts {
 		fmt.Printf("batch %s CLOSED rule=%s labels=%v previous=%s: %s\n",
 			del.BatchID, a.RuleID, a.Labels, a.PreviousStatus, a.Reason)
 	}
 
 	fmt.Println("-- change history (newest first; rejected pushes are kept too) --")
 	for _, rec := range p.RuleChangeHistory() {
-		fmt.Printf("  %s applied=%v changes=%d closed=%d problems=%d\n",
-			rec.BatchID, rec.Applied(), len(rec.Changes), len(rec.ClosedEvents), len(rec.ValidationErrors))
+		fmt.Printf("  %s applied=%v changes=%d continued=%d closed=%d problems=%d\n",
+			rec.BatchID, rec.Applied(), len(rec.Changes), len(rec.ContinuedAlerts),
+			len(rec.ClosedEvents), len(rec.ValidationErrors))
 	}
 }
